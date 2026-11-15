@@ -118,6 +118,15 @@ public final class OSGiServiceImpl implements OSGiService {
 		return framework == null ? null : framework.getBundleContext();
 	}
 
+	/**
+	 * The BundleContext of the framework, for code written for Lucee 8 and earlier that still calls
+	 * methods on it directly. Not part of OSGiService, the core finds it reflectively from
+	 * CFMLEngineImpl.getBundleContext() and hands it out unchanged.
+	 */
+	public Object getBundleContext() {
+		return runningContext();
+	}
+
 	// versions
 
 	/** OSGi version to the version style of Lucee: 1.0.0.5 stays, 1.0.0.RC becomes 1.0.0-RC */
