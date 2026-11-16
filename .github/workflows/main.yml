@@ -81,13 +81,20 @@ jobs:
           path: lucee
           ref: ${{ matrix.lucee.branch }}
 
+      # the Lucee 9 pre-releases are not on cdn.lucee.org (LDEV-6708), only on the Lucee Maven repository
+      - name: Download Lucee ${{ matrix.lucee.version }}
+        run: |
+          mkdir -p "${{ runner.temp }}/lucee-jar"
+          curl -fsSL -o "${{ runner.temp }}/lucee-jar/lucee-light-${{ matrix.lucee.version }}.jar" \
+            "${{ vars.LUCEE_MAVEN_URL || 'https://maven.lucee-services.com' }}/org/lucee/lucee/${{ matrix.lucee.version }}/lucee-${{ matrix.lucee.version }}-light.jar"
+
       - name: Run Lucee Test Suite
         uses: lucee/script-runner@main
         with:
           webroot: ${{ github.workspace }}/lucee/test
           execute: /bootstrap-tests.cfm
           luceeVersion: ${{ matrix.lucee.version }}
-          luceeVersionQuery: ${{ matrix.lucee.query }}
+          luceeJar: ${{ runner.temp }}/lucee-jar/lucee-light-${{ matrix.lucee.version }}.jar
           extensionDir: ${{ github.workspace }}/target
         env:
           testLabels: osgi
