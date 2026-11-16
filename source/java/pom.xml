@@ -31,6 +31,9 @@
   </developers>
 
   <properties>
+    <!-- the build.xml of the extension passes -Drevision with the version of the extension,
+         this default is only used when this pom is built on its own -->
+    <revision>1.0.0.0-SNAPSHOT</revision>
     <!-- needs a Lucee 9 that has lucee.runtime.osgi.BundleService (LDEV-6627) -->
     <lucee.version>9.0.0.1487-ALPHA</lucee.version>
   </properties>
