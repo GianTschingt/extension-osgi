@@ -32,7 +32,7 @@
 
   <properties>
     <!-- needs a Lucee 9 that has lucee.runtime.osgi.BundleService (LDEV-6627) -->
-    <lucee.version>9.0.0.1477-ALPHA</lucee.version>
+    <lucee.version>9.0.0.1487-ALPHA</lucee.version>
   </properties>
 
   <build>
