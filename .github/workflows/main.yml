@@ -96,6 +96,8 @@ jobs:
           luceeVersion: ${{ matrix.lucee.version }}
           luceeJar: ${{ runner.temp }}/lucee-jar/lucee-light-${{ matrix.lucee.version }}.jar
           extensionDir: ${{ github.workspace }}/target
+          # LDEV6075 (label osgi) re-installs the ESAPI extension, it has to be installed first, the light jar does not have it
+          extensions: 37C61C0A-5D7E-4256-8572639BE0CF5838
         env:
           testLabels: osgi
           testAdditional: ${{ github.workspace }}/tests
