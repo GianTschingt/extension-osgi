@@ -32,7 +32,7 @@
 
   <properties>
     <!-- needs a Lucee 9 that has lucee.runtime.osgi.BundleService (LDEV-6627) -->
-    <lucee.version>9.0.0.0-ALPHA</lucee.version>
+    <lucee.version>9.0.0.1487-ALPHA</lucee.version>
   </properties>
 
   <build>
@@ -176,6 +176,16 @@
       </resource>
     </resources>
   </build>
+
+  <!-- the Lucee 9 alpha builds are only published on the Lucee Maven repository, not on Maven Central -->
+  <repositories>
+    <repository>
+      <id>lucee-services</id>
+      <url>https://mvn.lucee-services.com</url>
+      <releases><enabled>true</enabled></releases>
+      <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+  </repositories>
 
   <dependencies>
     <dependency>
