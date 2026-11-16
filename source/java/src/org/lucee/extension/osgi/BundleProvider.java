@@ -465,8 +465,13 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 			synchronized (createToken("getMappings", "ini")) {
 				mappings = mappingsIni;
 				if (mappings == null) {
-					try (java.io.InputStream is = BundleProvider.class.getResourceAsStream("/resources/osgi-maven-mapping.ini")) {
-						if (is != null) mappings = readIni(is);
+					try {
+						URL url = OSGiServiceImpl.ownResource(BundleProvider.class, "resources/osgi-maven-mapping.ini");
+						if (url != null) {
+							try (java.io.InputStream is = url.openStream()) {
+								mappings = readIni(is);
+							}
+						}
 					}
 					catch (IOException e) {
 					}
