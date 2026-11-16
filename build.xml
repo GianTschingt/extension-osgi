@@ -118,7 +118,26 @@
         </copy>
     </target>
 
-    <target name="createManifest" depends="copy-dependencies" description="create MANIFEST.MF file">
+    <!-- the jars also have to land in the library directory of the config: a lex that only carries the
+         maven/ layout is deployed to lucee-server/mvn, where OSGi.discover() does not look, so the
+         OSGiService this extension provides would never be found -->
+    <target name="copy-jars" depends="copy-dependencies" description="jars the config puts on its classpath">
+        <mkdir dir="${dist}/extension/jars"/>
+        <copy todir="${dist}/extension/jars">
+            <fileset dir="source/java/target">
+                <include name="*.jar"/>
+                <exclude name="*-sources.jar"/>
+                <exclude name="*-javadoc.jar"/>
+            </fileset>
+        </copy>
+        <copy todir="${dist}/extension/jars">
+            <fileset dir="${temp}/dependency">
+                <include name="**/*.jar"/>
+            </fileset>
+        </copy>
+    </target>
+
+    <target name="createManifest" depends="copy-jars" description="create MANIFEST.MF file">
         <tstamp>
             <format property="NOW" pattern="yyyy-MM-dd HH:mm:ss"/>
         </tstamp>
