@@ -33,7 +33,7 @@ public final class BundleProvider {
 	private static final Map<String, String> tokens = new ConcurrentHashMap<String, String>();
 
 	private URL[] details;
-	private static Map<String, Pair> readers = new HashMap<>();
+	private static final Map<String, Pair> readers = new ConcurrentHashMap<>();
 
 	static {
 		try {
@@ -483,19 +483,45 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 		return mappings;
 	}
 
-	/** the newest version of the artifact a bundle is mapped to, read from the maven metadata, null when unknown */
-	public String latestVersion(String bundleName) {
+	/**
+	 * the newest release of the artifact a bundle is mapped to, read from the maven metadata, null when
+	 * the bundle is not mapped to a Maven artifact
+	 */
+	public String latestVersion(String bundleName) throws IOException {
+		return latestVersion(bundleName, null);
+	}
+
+	/**
+	 * the newest version of the artifact a bundle is mapped to that is inside the range (all versions
+	 * when the range is null), read from the maven metadata. Pre-releases (rc, alpha, beta, snapshot,
+	 * milestones) are skipped, unless the range itself asks for one. The version is returned in the
+	 * spelling of Maven (33.8.0-jre, 2.20). Null when the bundle is not mapped to a Maven artifact.
+	 *
+	 * @throws IOException when the bundle is mapped, but no version in the range could be found, with
+	 *             the reason for each repository
+	 */
+	public String latestVersion(String bundleName, org.osgi.framework.VersionRange range) throws IOException {
 		Info[] infos = getMappings().get(bundleName);
 		if (infos == null) return null;
+		boolean allowPreRelease = range != null && (isPreRelease(range.getLeft()) || isPreRelease(range.getRight()));
+		String requiredFlavour = flavour(range);
+		List<String> problems = new ArrayList<>();
+		boolean mapped = false;
 		for (Info info: infos) {
 			if (!info.isMaven()) continue;
+			mapped = true;
 			for (URL repo: getDefaultProviderDetailMvn()) {
+				URL url = null;
 				try {
-					URL url = new URL(repo, info.groupId.replace('.', '/') + "/" + info.artifactId + "/maven-metadata.xml");
+					url = new URL(repo, info.groupId.replace('.', '/') + "/" + info.artifactId + "/maven-metadata.xml");
 					HttpURLConnection conn = (HttpURLConnection) url.openConnection();
 					conn.setConnectTimeout(CONNECTION_TIMEOUT);
 					conn.setReadTimeout(CONNECTION_TIMEOUT * 3);
-					if (conn.getResponseCode() != 200) continue;
+					int code = conn.getResponseCode();
+					if (code != 200) {
+						problems.add("[" + url + "] returned status code " + code);
+						continue;
+					}
 					StringBuilder sb = new StringBuilder();
 					try (BufferedReader r = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
 						String line;
@@ -503,16 +529,71 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 							sb.append(line);
 						}
 					}
-					for (String tag: new String[] { "release", "latest" }) {
-						java.util.regex.Matcher m = java.util.regex.Pattern.compile("<" + tag + ">([^<]+)</" + tag + ">").matcher(sb);
-						if (m.find()) return m.group(1).trim();
+					String best = null;
+					Version bestVersion = null;
+					java.util.regex.Matcher m = VERSION_TAG.matcher(sb);
+					while (m.find()) {
+						String raw = m.group(1).trim();
+						if (!allowPreRelease && isPreRelease(raw)) continue;
+						if (!requiredFlavour.isEmpty() && !requiredFlavour.equals(flavour(raw))) continue;
+						Version v = toVersion(raw, null);
+						if (v == null) continue;
+						if (range != null && !range.includes(v)) continue;
+						if (bestVersion == null || v.compareTo(bestVersion) > 0) {
+							best = raw;
+							bestVersion = v;
+						}
 					}
+					if (best != null) return best;
+					problems.add("[" + url + "] has no " + (allowPreRelease ? "version" : "release") + (range == null ? "" : " inside the range " + range));
 				}
 				catch (Exception e) {
+					problems.add("[" + (url == null ? repo : url) + "] failed: " + e);
 				}
 			}
 		}
-		return null;
+		if (!mapped) return null;
+		throw new IOException("no version of the bundle [" + bundleName + "]" + (range == null ? "" : " inside the range " + range) + " found: " + String.join("; ", problems));
+	}
+
+	private static final java.util.regex.Pattern VERSION_TAG = java.util.regex.Pattern.compile("<version>([^<]+)</version>");
+	private static final java.util.regex.Pattern PRE_RELEASE = java.util.regex.Pattern
+			.compile("(?i)(?:^|[.\\-_])(?:snapshot|alpha|beta|rc|cr|m|milestone|ea|preview|pre|dev|a|b)\\d*(?:[.\\-_]|$)");
+
+	/** true for versions like 3.0-rc5, 2.0.0-M1, 1.0-SNAPSHOT, 5.4.0.Beta1 or 1.0.0-ALPHA */
+	public static boolean isPreRelease(Object version) {
+		if (version == null) return false;
+		String str = version instanceof Version ? ((Version) version).getQualifier() : version.toString();
+		if (str == null || str.isEmpty()) return false;
+		// the numeric part does not count, only the qualifier
+		java.util.regex.Matcher m = java.util.regex.Pattern.compile("^\\d+(?:\\.\\d+)*").matcher(str);
+		String rest = m.find() ? str.substring(m.end()) : str;
+		return !rest.isEmpty() && PRE_RELEASE.matcher(rest.startsWith(".") || rest.startsWith("-") || rest.startsWith("_") ? rest : "." + rest).find();
+	}
+
+	private static final java.util.regex.Pattern FLAVOUR = java.util.regex.Pattern.compile("(?i)^(jre|android)\\d*$");
+
+	/**
+	 * the mutually exclusive classifier of a version, currently "jre" or "android" (as used by Guava),
+	 * otherwise empty. When a range asks for one of these, {@link #latestVersion} only considers
+	 * versions with the same flavour.
+	 */
+	static String flavour(Object version) {
+		if (version == null) return "";
+		if (version instanceof org.osgi.framework.VersionRange) {
+			org.osgi.framework.VersionRange range = (org.osgi.framework.VersionRange) version;
+			String left = flavour(range.getLeft());
+			return !left.isEmpty() ? left : flavour(range.getRight());
+		}
+		String q;
+		if (version instanceof Version) q = ((Version) version).getQualifier();
+		else {
+			Version v = toVersion(version.toString(), null);
+			q = v == null ? "" : v.getQualifier();
+		}
+		if (q == null || q.isEmpty()) return "";
+		java.util.regex.Matcher m = FLAVOUR.matcher(q);
+		return m.matches() ? m.group(1).toLowerCase() : "";
 	}
 
 	private static String createToken(String prefix, String name) {
@@ -604,22 +685,13 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 		Info[] infos = getMappings().get(bd.name);
 		if (infos != null && infos.length > 0) {
 
-			String v;
 			for (Info info: infos) {
 
 				if (!info.isMaven()) continue;
 				for (URL repo: getDefaultProviderDetailMvn()) {
-					v = bd.getVersionAsString();
-					url = validate(createURL(repo, info, v), null);
-					if (url != null) {
-						return url;
-					}
-					if (v != null && v.endsWith(".0")) {
-						v = v.substring(0, v.length() - 2);
+					for (String v: bd.getMavenVersions()) {
 						url = validate(createURL(repo, info, v), null);
-						if (url != null) {
-							return url;
-						}
+						if (url != null) return url;
 					}
 				}
 			}
@@ -631,8 +703,10 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 			String last = index == -1 ? bd.name : bd.name.substring(index + 1);
 
 			for (URL repo: getDefaultProviderDetailMvn()) {
-				url = validate(new URL(repo, bd.name.replace('.', '/') + "/" + bd.version + "/" + last + "-" + bd.version + ".jar"), null);
-				if (url != null) return url;
+				for (String v: bd.getMavenVersions()) {
+					url = validate(new URL(repo, bd.name.replace('.', '/') + "/" + v + "/" + last + "-" + v + ".jar"), null);
+					if (url != null) return url;
+				}
 			}
 		}
 		// S3: we check for a direct match
@@ -641,7 +715,7 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 			if (url != null) return url;
 		}
 
-		throw new IOException("no URL found for bundle [" + bd.name + ":" + bd.version + "]");
+		throw new IOException("no URL found for bundle [" + bd.name + ":" + bd.getRawVersion() + "]");
 	}
 
 	private static Map<String, Info[]> readIni(java.io.InputStream ini) throws IOException {
@@ -716,6 +790,7 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 			conn = (HttpURLConnection) url.openConnection();
 			conn.setRequestMethod("HEAD");
 			conn.setConnectTimeout(BundleProvider.CONNECTION_TIMEOUT);
+			conn.setReadTimeout(BundleProvider.CONNECTION_TIMEOUT);
 			conn.connect();
 			int code = conn.getResponseCode();
 			if (code >= 200 && code < 300) return url;
@@ -785,19 +860,46 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 		private static final int QUALIFIER_APPENDIX_STABLE = 5;
 		private String name;
 		private Version version;
+		private String rawVersion;
 
 		public BundleDefinition(String name, Version version) {
 			this.name = name;
 			this.version = version;
+			this.rawVersion = version == null ? null : version.toString();
 		}
 
 		public BundleDefinition(String name, String version) throws BundleException {
 			this.name = name;
 			this.version = toVersion(version);
+			this.rawVersion = version == null ? null : version.trim();
 		}
 
 		public String getVersionAsString() {
 			return version == null ? null : version.toString();
+		}
+
+		/** the version as it was given, for example 33.8.0-jre */
+		public String getRawVersion() {
+			return rawVersion;
+		}
+
+		/**
+		 * the spellings of the version a Maven artifact may use, the given one first: 33.8.0-jre (as given),
+		 * 33.8.0.jre (OSGi), and for 2.17.0 also 2.17
+		 */
+		public List<String> getMavenVersions() {
+			java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<>();
+			if (rawVersion != null && !rawVersion.isEmpty()) set.add(rawVersion);
+			if (version != null) {
+				String q = version.getQualifier();
+				String base = version.getMajor() + "." + version.getMinor() + "." + version.getMicro();
+				if (!q.isEmpty() && !Character.isDigit(q.charAt(0))) set.add(base + "-" + q);
+				set.add(version.toString());
+				if (q.isEmpty() && version.getMicro() == 0) {
+					set.add(version.getMajor() + "." + version.getMinor());
+				}
+			}
+			return new ArrayList<>(set);
 		}
 
 		public int compare(BundleDefinition bd) {
@@ -872,51 +974,50 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 		}
 	}
 
-	private static Version toVersion(String version, Version defaultValue) {
-		if (Util.isEmpty(version)) return defaultValue;
-		// String[] arr = ListUtil.listToStringArray(version, '.');
-		String[] arr;
+	/**
+	 * a version as OSGi version, this also accepts the Maven spelling: 33.8.0-jre becomes 33.8.0.jre,
+	 * 2.17 becomes 2.17.0, 3.0-rc5 becomes 3.0.0.rc5 and 1.0.0.5 stays.
+	 * Extra numeric segments become the qualifier with dots replaced by underscores (1.2.3.4.5
+	 * becomes 1.2.3.4_5), so two different Maven spellings can compare equal after parsing.
+	 * A numeric part that does not fit in an int (for example 20030203000129) returns
+	 * {@code defaultValue} silently; {@link #latestVersion} skips that entry.
+	 */
+	static Version toVersion(String version, Version defaultValue) {
+		if (Util.isEmpty(version, true)) return defaultValue;
+		version = version.trim();
+		int[] nums = new int[3];
+		int count = 0;
+		int i = 0;
+		int len = version.length();
 		try {
-
-			arr = version.split("\\.");
-			;
+			while (count < 3 && i < len && Character.isDigit(version.charAt(i))) {
+				int start = i;
+				while (i < len && Character.isDigit(version.charAt(i))) i++;
+				nums[count++] = Integer.parseInt(version.substring(start, i));
+				// a dot followed by a number continues the numeric part
+				if (count < 3 && i + 1 < len && version.charAt(i) == '.' && Character.isDigit(version.charAt(i + 1))) i++;
+				else break;
+			}
 		}
-		catch (Exception e) {
-			return defaultValue; // should not happen
+		catch (NumberFormatException nfe) {
+			return defaultValue;
 		}
-
-		Integer major, minor, micro;
-		String qualifier;
-
-		if (arr.length == 1) {
-			major = Integer.parseInt(arr[0]);
-			minor = 0;
-			micro = 0;
-			qualifier = null;
+		if (count == 0) return defaultValue;
+		String qualifier = i < len ? version.substring(i) : "";
+		// the separator between the numbers and the qualifier
+		if (!qualifier.isEmpty() && (qualifier.charAt(0) == '.' || qualifier.charAt(0) == '-' || qualifier.charAt(0) == '_')) qualifier = qualifier.substring(1);
+		if (qualifier.isEmpty()) return new Version(nums[0], nums[1], nums[2]);
+		// OSGi only allows letters, digits, _ and - in the qualifier
+		StringBuilder sb = new StringBuilder(qualifier.length());
+		for (char c: qualifier.toCharArray()) {
+			sb.append(Character.isLetterOrDigit(c) || c == '_' || c == '-' ? c : '_');
 		}
-		else if (arr.length == 2) {
-			major = Integer.parseInt(arr[0]);
-			minor = Integer.parseInt(arr[1]);
-			micro = 0;
-			qualifier = null;
+		try {
+			return new Version(nums[0], nums[1], nums[2], sb.toString());
 		}
-		else if (arr.length == 3) {
-			major = Integer.parseInt(arr[0]);
-			minor = Integer.parseInt(arr[1]);
-			micro = Integer.parseInt(arr[2]);
-			qualifier = null;
+		catch (IllegalArgumentException iae) {
+			return defaultValue;
 		}
-		else {
-			major = Integer.parseInt(arr[0]);
-			minor = Integer.parseInt(arr[1]);
-			micro = Integer.parseInt(arr[2]);
-			qualifier = arr[3];
-		}
-
-		if (major == null || minor == null || micro == null) return defaultValue;
-
-		if (qualifier == null) return new Version(major, minor, micro);
-		return new Version(major, minor, micro, qualifier);
 	}
 
 	private static Version toVersion(String version) throws BundleException {

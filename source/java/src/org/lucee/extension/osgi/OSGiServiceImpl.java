@@ -28,6 +28,7 @@ import org.osgi.framework.BundleContext;
 import org.osgi.framework.BundleException;
 import org.osgi.framework.BundleReference;
 import org.osgi.framework.Constants;
+import org.osgi.framework.VersionRange;
 import org.osgi.framework.launch.Framework;
 import org.osgi.framework.launch.FrameworkFactory;
 import org.osgi.framework.wiring.BundleRevision;
@@ -128,6 +129,7 @@ public final class OSGiServiceImpl implements OSGiService {
 		for (String key: props.stringPropertyNames()) {
 			if (!config.containsKey(key)) config.put(key, props.getProperty(key));
 		}
+		// system properties and environment variables still override these values later in framework()
 		// the values above contain placeholders like ${jre-${felix.detect.jpms}}
 		if (!config.containsKey("felix.systempackages.substitution")) config.put("felix.systempackages.substitution", "true");
 	}
@@ -192,11 +194,30 @@ public final class OSGiServiceImpl implements OSGiService {
 		return base + (c >= '0' && c <= '9' ? "." : "-") + q;
 	}
 
+	/**
+	 * the version to download when the bundle is not mapped to a Maven artifact. For a closed
+	 * lower bound this is the lower bound itself, so a requirement of "&gt;=X" is treated as the
+	 * exact version X. Null when there is no range or the lower bound is open; download() then
+	 * fails with a readable message.
+	 */
+	static String unmappedVersion(VersionRange range) {
+		if (range != null && range.getLeftType() == VersionRange.LEFT_CLOSED) return toLucee(range.getLeft());
+		return null;
+	}
+
 	private static boolean matches(String symbolicName, org.osgi.framework.Version bundleVersion, String name, String version) {
 		if (!name.equals(symbolicName)) return false;
 		if (version == null || version.trim().isEmpty()) return true;
 		String v = version.trim();
-		return v.equalsIgnoreCase(toLucee(bundleVersion)) || v.equalsIgnoreCase(bundleVersion.toString());
+		if (v.equalsIgnoreCase(toLucee(bundleVersion)) || v.equalsIgnoreCase(bundleVersion.toString())) return true;
+		// the Maven spelling of the same version (33.8.0-jre is 33.8.0.jre, 2.17 is 2.17.0)
+		org.osgi.framework.Version parsed = BundleProvider.toVersion(v, null);
+		return parsed != null && parsed.equals(bundleVersion);
+	}
+
+	private static boolean matches(String symbolicName, org.osgi.framework.Version bundleVersion, String name, VersionRange range) {
+		if (!name.equals(symbolicName)) return false;
+		return range == null || range.includes(bundleVersion);
 	}
 
 	private static Bundle find(BundleContext ctx, String name, String version) {
@@ -204,6 +225,17 @@ public final class OSGiServiceImpl implements OSGiService {
 		Bundle best = null;
 		for (Bundle b: ctx.getBundles()) {
 			if (b.getState() == Bundle.UNINSTALLED || !matches(b.getSymbolicName(), b.getVersion(), name, version)) continue;
+			if (best == null || b.getVersion().compareTo(best.getVersion()) > 0) best = b;
+		}
+		return best;
+	}
+
+	/** the newest installed bundle with that name inside the range, any version when the range is null */
+	private static Bundle find(BundleContext ctx, String name, VersionRange range) {
+		if (ctx == null) return null;
+		Bundle best = null;
+		for (Bundle b: ctx.getBundles()) {
+			if (b.getState() == Bundle.UNINSTALLED || !matches(b.getSymbolicName(), b.getVersion(), name, range)) continue;
 			if (best == null || b.getVersion().compareTo(best.getVersion()) > 0) best = b;
 		}
 		return best;
@@ -252,6 +284,48 @@ public final class OSGiServiceImpl implements OSGiService {
 		return best;
 	}
 
+	private static final class JarVersion {
+		final File jar;
+		final org.osgi.framework.Version version;
+
+		JarVersion(File jar, org.osgi.framework.Version version) {
+			this.jar = jar;
+			this.version = version;
+		}
+	}
+
+	/** the jar with the newest version of the bundle inside the range, any version when the range is null */
+	private static File findJar(File dir, String name, VersionRange range) {
+		JarVersion best = findJarVersion(dir, name, range);
+		return best == null ? null : best.jar;
+	}
+
+	private static JarVersion findJarVersion(File dir, String name, VersionRange range) {
+		File[] jars = dir == null ? null : dir.listFiles((d, n) -> n.endsWith(".jar"));
+		if (jars == null) return null;
+		File best = null;
+		org.osgi.framework.Version bestVersion = null;
+		for (File jar: jars) {
+			Object[] nv = read(jar);
+			if (nv == null || !matches((String) nv[0], (org.osgi.framework.Version) nv[1], name, range)) continue;
+			org.osgi.framework.Version v = (org.osgi.framework.Version) nv[1];
+			if (best == null || v.compareTo(bestVersion) > 0) {
+				best = jar;
+				bestVersion = v;
+			}
+		}
+		return best == null ? null : new JarVersion(best, bestVersion);
+	}
+
+	private Bundle install(BundleContext ctx, File jar) throws IOException {
+		try {
+			return ctx.installBundle(jar.toURI().toString());
+		}
+		catch (BundleException e) {
+			throw new IOException(e.getMessage(), e);
+		}
+	}
+
 	/**
 	 * the installed bundle, installing it from the local bundle directory, one of the given directories or a
 	 * download when necessary
@@ -262,7 +336,7 @@ public final class OSGiServiceImpl implements OSGiService {
 	private Bundle load(String name, String version, File[] dirs, boolean versionOnlyMatters) throws IOException {
 		BundleContext ctx = context();
 		Bundle b = find(ctx, name, version);
-		if (b == null && versionOnlyMatters) b = find(ctx, name, null);
+		if (b == null && versionOnlyMatters) b = find(ctx, name, (String) null);
 		if (b != null) return b;
 
 		File jar = findJar(bundleDirectory, name, version);
@@ -272,14 +346,38 @@ public final class OSGiServiceImpl implements OSGiService {
 				if (jar != null) break;
 			}
 		}
-		if (jar == null && versionOnlyMatters) jar = findJar(bundleDirectory, name, null);
+		if (jar == null && versionOnlyMatters) jar = findJar(bundleDirectory, name, (String) null);
 		if (jar == null) jar = download(name, version);
-		try {
-			return ctx.installBundle(jar.toURI().toString());
+		return install(ctx, jar);
+	}
+
+	/**
+	 * the newest bundle with that name inside the range (any version when the range is null) that is
+	 * installed, in the local bundle directory or in one of the given directories, otherwise the newest
+	 * release inside the range is downloaded
+	 */
+	private Bundle load(String name, VersionRange range, File[] dirs) throws IOException {
+		BundleContext ctx = context();
+		Bundle b = find(ctx, name, range);
+		if (b != null) return b;
+
+		JarVersion best = findJarVersion(bundleDirectory, name, range);
+		if (dirs != null) {
+			for (File dir: dirs) {
+				JarVersion candidate = findJarVersion(dir, name, range);
+				if (candidate != null && (best == null || candidate.version.compareTo(best.version) > 0)) best = candidate;
+			}
 		}
-		catch (BundleException e) {
-			throw new IOException(e.getMessage(), e);
+		File jar = best == null ? null : best.jar;
+		if (jar == null) {
+			String version = BundleProvider.getInstance().latestVersion(name, range);
+			// not a Maven artifact we know, the lower end of a closed range is used as the exact
+			// version (a documented limitation: ">=X" is still exact X for unmapped bundles).
+			// an open lower bound leaves version null and download() fails with a readable message.
+			if (version == null) version = unmappedVersion(range);
+			jar = download(name, version);
 		}
+		return install(ctx, jar);
 	}
 
 	/** download a bundle into the bundle directory */
@@ -294,28 +392,40 @@ public final class OSGiServiceImpl implements OSGiService {
 		catch (BundleException | RuntimeException e) {
 			throw new IOException("no download for the bundle [" + name + ":" + version + "]: " + e.getMessage(), e);
 		}
-		File tmp = new File(bundleDirectory, name + "-" + version + ".jar.tmp");
-		try (InputStream is = url.openStream(); OutputStream os = new FileOutputStream(tmp)) {
-			byte[] buf = new byte[8192];
-			int len;
-			while ((len = is.read(buf)) != -1) {
-				os.write(buf, 0, len);
+		// a unique file, the same bundle may be downloaded by two threads at the same time
+		File tmp = File.createTempFile(safe(name) + "-", ".jar.tmp", bundleDirectory);
+		try {
+			java.net.URLConnection conn = url.openConnection();
+			conn.setConnectTimeout(BundleProvider.CONNECTION_TIMEOUT);
+			conn.setReadTimeout(BundleProvider.CONNECTION_TIMEOUT * 3);
+			try (InputStream is = conn.getInputStream(); OutputStream os = new FileOutputStream(tmp)) {
+				byte[] buf = new byte[8192];
+				int len;
+				while ((len = is.read(buf)) != -1) {
+					os.write(buf, 0, len);
+				}
 			}
+			Object[] nv = read(tmp);
+			if (nv == null) throw new IOException("the file downloaded from [" + url + "] is not an OSGi bundle");
+			File target = new File(bundleDirectory, nv[0] + "-" + toLucee((org.osgi.framework.Version) nv[1]) + ".jar");
+			if (!target.isFile() && !tmp.renameTo(target) && !target.isFile()) throw new IOException("failed to move the downloaded bundle to [" + target + "]");
+			return target;
 		}
-		Object[] nv = read(tmp);
-		if (nv == null) {
-			tmp.delete();
-			throw new IOException("the file downloaded from [" + url + "] is not an OSGi bundle");
+		finally {
+			if (tmp.isFile()) tmp.delete();
 		}
-		File target = new File(bundleDirectory, nv[0] + "-" + toLucee((org.osgi.framework.Version) nv[1]) + ".jar");
-		if (target.isFile()) tmp.delete();
-		else if (!tmp.renameTo(target)) throw new IOException("failed to move the downloaded bundle to [" + target + "]");
-		return target;
+	}
+
+	private static String safe(String name) {
+		String str = name.replaceAll("[^A-Za-z0-9._-]", "_");
+		// createTempFile needs a prefix of at least 3 characters
+		return str.length() < 3 ? str + "___" : str;
 	}
 
 	private Bundle loadAndStart(String name, String version, File[] dirs, boolean versionOnlyMatters) throws IOException {
 		Bundle b = load(name, version, dirs, versionOnlyMatters);
 		Set<String> tried = new HashSet<>();
+		List<String> problems = new ArrayList<>();
 		while (true) {
 			try {
 				startIfNecessary(b);
@@ -323,13 +433,71 @@ public final class OSGiServiceImpl implements OSGiService {
 			}
 			catch (BundleException be) {
 				// a bundle this bundle depends on may be missing, load it and try again
-				if (!loadMissing(be.getMessage(), dirs, tried)) throw new IOException(be.getMessage(), be);
+				if (!loadMissing(be.getMessage(), dirs, tried, problems)) {
+					String msg = be.getMessage();
+					if (!problems.isEmpty()) msg += " (failed to load what is missing: " + String.join("; ", problems) + ")";
+					throw new IOException(msg, be);
+				}
 			}
 		}
 	}
 
-	private static final Pattern MISSING_BUNDLE = Pattern.compile("osgi\\.wiring\\.bundle=([^)]+)\\)(?:\\(bundle-version>=([^)]+)\\))?");
-	private static final Pattern MISSING_PACKAGE = Pattern.compile("osgi\\.wiring\\.package=([^)]+)\\)");
+	// one requirement from the message of a failed start, for example
+	// (&(osgi.wiring.bundle=a.b)(bundle-version>=2.17.0)(!(bundle-version>=3.0.0)))
+	// (&(osgi.wiring.package=a.b)(version>=2.17.0)(!(version>=3.0.0)))
+	private static final Pattern MISSING = Pattern.compile("osgi\\.wiring\\.(bundle|package)=([^)]+)\\)((?:\\((?:!\\()?(?:bundle-)?version[<>]?=[^)]+\\)\\)?)*)");
+	private static final Pattern CONSTRAINT = Pattern.compile("\\((!\\()?(?:bundle-)?version([<>]?=)([^)]+)\\)");
+
+	/**
+	 * the version range of the constraints of a requirement filter, like (version>=2.17.0)(!(version>=3.0.0)),
+	 * null when there is no constraint
+	 */
+	static VersionRange toRange(String constraints) {
+		if (constraints == null || constraints.isEmpty()) return null;
+		org.osgi.framework.Version floor = null, ceiling = null;
+		boolean floorClosed = true, ceilingClosed = false;
+		Matcher m = CONSTRAINT.matcher(constraints);
+		boolean any = false;
+		while (m.find()) {
+			boolean not = m.group(1) != null;
+			String op = m.group(2);
+			org.osgi.framework.Version v;
+			try {
+				v = org.osgi.framework.Version.parseVersion(m.group(3).trim());
+			}
+			catch (IllegalArgumentException iae) {
+				continue;
+			}
+			any = true;
+			if ("=".equals(op) && !not) {
+				floor = ceiling = v;
+				floorClosed = ceilingClosed = true;
+			}
+			else if (">=".equals(op)) {
+				if (not) { // (!(version>=X)) is version<X
+					ceiling = v;
+					ceilingClosed = false;
+				}
+				else {
+					floor = v;
+					floorClosed = true;
+				}
+			}
+			else if ("<=".equals(op)) {
+				if (not) { // (!(version<=X)) is version>X
+					floor = v;
+					floorClosed = false;
+				}
+				else {
+					ceiling = v;
+					ceilingClosed = true;
+				}
+			}
+		}
+		if (!any) return null;
+		if (floor == null) floor = org.osgi.framework.Version.emptyVersion;
+		return new VersionRange(floorClosed ? VersionRange.LEFT_CLOSED : VersionRange.LEFT_OPEN, floor, ceiling, ceilingClosed ? VersionRange.RIGHT_CLOSED : VersionRange.RIGHT_OPEN);
+	}
 
 	// packages of bundles that are no longer part of Lucee, extensions that still import them get the bundle
 	private static final Map<String, String> PACKAGE_BUNDLE = new HashMap<>();
@@ -344,6 +512,9 @@ public final class OSGiServiceImpl implements OSGiService {
 		PACKAGE_BUNDLE.put("org.bouncycastle.sasn1", "bouncycastle.mail");
 		PACKAGE_BUNDLE.put("org.bouncycastle", "bcprov");
 		PACKAGE_BUNDLE.put("com.fasterxml.jackson.annotation", "com.fasterxml.jackson.core.jackson-annotations");
+		PACKAGE_BUNDLE.put("com.fasterxml.jackson.core", "com.fasterxml.jackson.core.jackson-core");
+		PACKAGE_BUNDLE.put("com.fasterxml.jackson.databind", "com.fasterxml.jackson.core.jackson-databind");
+		PACKAGE_BUNDLE.put("com.google.common.util.concurrent.internal", "com.google.guava.failureaccess");
 		PACKAGE_BUNDLE.put("org.apache.lucene.analysis", "apache.lucene");
 		PACKAGE_BUNDLE.put("com.sun.jna", "com.sun.jna");
 		PACKAGE_BUNDLE.put("org.apache.commons.lang", "org.apache.commons.lang");
@@ -352,46 +523,55 @@ public final class OSGiServiceImpl implements OSGiService {
 		PACKAGE_BUNDLE.put("javax.activation", "com.sun.activation.javax.activation");
 	}
 
-	/** loads the bundles and packages the message of a failed start says are missing, false when nothing could be loaded */
-	private boolean loadMissing(String message, File[] dirs, Set<String> tried) {
+	/**
+	 * loads the bundles and packages the message of a failed start says are missing, false when nothing
+	 * could be loaded, the reasons are added to problems
+	 */
+	private boolean loadMissing(String message, File[] dirs, Set<String> tried, List<String> problems) {
 		boolean loaded = false;
-		Matcher m = MISSING_BUNDLE.matcher(message);
+		Matcher m = MISSING.matcher(message);
 		while (m.find()) {
-			String name = m.group(1).trim();
-			String version = m.group(2) == null ? null : m.group(2).trim();
-			if (!tried.add("b:" + name + ":" + version)) continue;
+			boolean isBundle = "bundle".equals(m.group(1));
+			String name = m.group(2).trim();
+			VersionRange range = toRange(m.group(3));
+			if (!tried.add((isBundle ? "b:" : "p:") + name + ":" + range)) continue;
 			try {
-				load(name, version, dirs, true);
-				loaded = true;
-			}
-			catch (IOException e) {
-			}
-		}
-		m = MISSING_PACKAGE.matcher(message);
-		while (m.find()) {
-			String pkg = m.group(1).trim();
-			if (!tried.add("p:" + pkg)) continue;
-			try {
-				File jar = findExporting(bundleDirectory, pkg);
+				if (isBundle) {
+					load(name, range, dirs);
+					loaded = true;
+					continue;
+				}
+				// a package
+				File jar = findExporting(bundleDirectory, name, range);
 				if (jar != null) {
 					context().installBundle(jar.toURI().toString());
 					loaded = true;
 					continue;
 				}
-				String name = PACKAGE_BUNDLE.get(pkg);
-				if (name != null) {
-					load(name, null, dirs, true);
+				String bundle = PACKAGE_BUNDLE.get(name);
+				// a bundle that has the name of the package, like com.google.gson
+				if (bundle == null && BundleProvider.getMappings().containsKey(name)) bundle = name;
+				if (bundle != null) {
+					// the version of the package is the version of the bundle for most bundles.
+					// do not fall back to any version when nothing fits the range (that would
+					// load a 3.x for a [2.17,3) package). local jars are only used when
+					// findExporting confirms Export-Package is inside the range.
+					load(bundle, range, dirs);
 					loaded = true;
 				}
+				else {
+					problems.add("no bundle known that exports the package [" + name + "]" + (range == null ? "" : " " + range));
+				}
 			}
-			catch (IOException | BundleException e) {
+			catch (IOException | BundleException | RuntimeException e) {
+				problems.add((isBundle ? "bundle [" : "package [") + name + "]" + (range == null ? "" : " " + range) + ": " + e.getMessage());
 			}
 		}
 		return loaded;
 	}
 
-	/** a bundle in the directory that exports the package */
-	private static File findExporting(File dir, String pkg) {
+	/** a bundle in the directory that exports the package in a version inside the range */
+	private static File findExporting(File dir, String pkg, VersionRange range) {
 		File[] jars = dir == null ? null : dir.listFiles((d, n) -> n.endsWith(".jar"));
 		if (jars == null) return null;
 		for (File jar: jars) {
@@ -400,10 +580,21 @@ public final class OSGiServiceImpl implements OSGiService {
 				String exports = mf == null ? null : mf.getMainAttributes().getValue("Export-Package");
 				if (exports == null) continue;
 				for (String part: exports.split(",(?=[^\"]*(?:\"[^\"]*\"[^\"]*)*$)")) {
-					String name = part.trim();
-					int idx = name.indexOf(';');
-					if (idx != -1) name = name.substring(0, idx);
-					if (pkg.equals(name.trim())) return jar;
+					String[] attrs = part.split(";(?=[^\"]*(?:\"[^\"]*\"[^\"]*)*$)");
+					if (!pkg.equals(attrs[0].trim())) continue;
+					if (range == null) return jar;
+					org.osgi.framework.Version v = org.osgi.framework.Version.emptyVersion;
+					for (int i = 1; i < attrs.length; i++) {
+						String a = attrs[i].trim();
+						if (a.startsWith("version=")) {
+							try {
+								v = org.osgi.framework.Version.parseVersion(removeQuotes(a.substring(8)));
+							}
+							catch (IllegalArgumentException iae) {
+							}
+						}
+					}
+					if (range.includes(v)) return jar;
 				}
 			}
 			catch (IOException e) {
