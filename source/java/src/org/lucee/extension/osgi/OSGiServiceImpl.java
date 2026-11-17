@@ -129,6 +129,7 @@ public final class OSGiServiceImpl implements OSGiService {
 		for (String key: props.stringPropertyNames()) {
 			if (!config.containsKey(key)) config.put(key, props.getProperty(key));
 		}
+		// system properties and environment variables still override these values later in framework()
 		// the values above contain placeholders like ${jre-${felix.detect.jpms}}
 		if (!config.containsKey("felix.systempackages.substitution")) config.put("felix.systempackages.substitution", "true");
 	}
@@ -191,6 +192,17 @@ public final class OSGiServiceImpl implements OSGiService {
 		if (q.isEmpty()) return base;
 		char c = q.charAt(0);
 		return base + (c >= '0' && c <= '9' ? "." : "-") + q;
+	}
+
+	/**
+	 * the version to download when the bundle is not mapped to a Maven artifact. For a closed
+	 * lower bound this is the lower bound itself, so a requirement of "&gt;=X" is treated as the
+	 * exact version X. Null when there is no range or the lower bound is open; download() then
+	 * fails with a readable message.
+	 */
+	static String unmappedVersion(VersionRange range) {
+		if (range != null && range.getLeftType() == VersionRange.LEFT_CLOSED) return toLucee(range.getLeft());
+		return null;
 	}
 
 	private static boolean matches(String symbolicName, org.osgi.framework.Version bundleVersion, String name, String version) {
@@ -272,8 +284,23 @@ public final class OSGiServiceImpl implements OSGiService {
 		return best;
 	}
 
+	private static final class JarVersion {
+		final File jar;
+		final org.osgi.framework.Version version;
+
+		JarVersion(File jar, org.osgi.framework.Version version) {
+			this.jar = jar;
+			this.version = version;
+		}
+	}
+
 	/** the jar with the newest version of the bundle inside the range, any version when the range is null */
 	private static File findJar(File dir, String name, VersionRange range) {
+		JarVersion best = findJarVersion(dir, name, range);
+		return best == null ? null : best.jar;
+	}
+
+	private static JarVersion findJarVersion(File dir, String name, VersionRange range) {
 		File[] jars = dir == null ? null : dir.listFiles((d, n) -> n.endsWith(".jar"));
 		if (jars == null) return null;
 		File best = null;
@@ -287,7 +314,7 @@ public final class OSGiServiceImpl implements OSGiService {
 				bestVersion = v;
 			}
 		}
-		return best;
+		return best == null ? null : new JarVersion(best, bestVersion);
 	}
 
 	private Bundle install(BundleContext ctx, File jar) throws IOException {
@@ -334,17 +361,20 @@ public final class OSGiServiceImpl implements OSGiService {
 		Bundle b = find(ctx, name, range);
 		if (b != null) return b;
 
-		File jar = findJar(bundleDirectory, name, range);
+		JarVersion best = findJarVersion(bundleDirectory, name, range);
 		if (dirs != null) {
 			for (File dir: dirs) {
-				File candidate = findJar(dir, name, range);
-				if (candidate != null && (jar == null || ((org.osgi.framework.Version) read(candidate)[1]).compareTo((org.osgi.framework.Version) read(jar)[1]) > 0)) jar = candidate;
+				JarVersion candidate = findJarVersion(dir, name, range);
+				if (candidate != null && (best == null || candidate.version.compareTo(best.version) > 0)) best = candidate;
 			}
 		}
+		File jar = best == null ? null : best.jar;
 		if (jar == null) {
 			String version = BundleProvider.getInstance().latestVersion(name, range);
-			// not a Maven artifact we know, the lower end of the range is the best guess
-			if (version == null && range != null && range.getLeftType() == VersionRange.LEFT_CLOSED) version = toLucee(range.getLeft());
+			// not a Maven artifact we know, the lower end of a closed range is used as the exact
+			// version (a documented limitation: ">=X" is still exact X for unmapped bundles).
+			// an open lower bound leaves version null and download() fails with a readable message.
+			if (version == null) version = unmappedVersion(range);
 			jar = download(name, version);
 		}
 		return install(ctx, jar);
@@ -522,14 +552,11 @@ public final class OSGiServiceImpl implements OSGiService {
 				// a bundle that has the name of the package, like com.google.gson
 				if (bundle == null && BundleProvider.getMappings().containsKey(name)) bundle = name;
 				if (bundle != null) {
-					// the version of the package is the version of the bundle for most bundles
-					try {
-						load(bundle, range, dirs);
-					}
-					catch (IOException e) {
-						if (range == null) throw e;
-						load(bundle, (VersionRange) null, dirs);
-					}
+					// the version of the package is the version of the bundle for most bundles.
+					// do not fall back to any version when nothing fits the range (that would
+					// load a 3.x for a [2.17,3) package). local jars are only used when
+					// findExporting confirms Export-Package is inside the range.
+					load(bundle, range, dirs);
 					loaded = true;
 				}
 				else {

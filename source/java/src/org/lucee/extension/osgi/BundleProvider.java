@@ -504,6 +504,7 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 		Info[] infos = getMappings().get(bundleName);
 		if (infos == null) return null;
 		boolean allowPreRelease = range != null && (isPreRelease(range.getLeft()) || isPreRelease(range.getRight()));
+		String requiredFlavour = flavour(range);
 		List<String> problems = new ArrayList<>();
 		boolean mapped = false;
 		for (Info info: infos) {
@@ -534,6 +535,7 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 					while (m.find()) {
 						String raw = m.group(1).trim();
 						if (!allowPreRelease && isPreRelease(raw)) continue;
+						if (!requiredFlavour.isEmpty() && !requiredFlavour.equals(flavour(raw))) continue;
 						Version v = toVersion(raw, null);
 						if (v == null) continue;
 						if (range != null && !range.includes(v)) continue;
@@ -567,6 +569,31 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 		java.util.regex.Matcher m = java.util.regex.Pattern.compile("^\\d+(?:\\.\\d+)*").matcher(str);
 		String rest = m.find() ? str.substring(m.end()) : str;
 		return !rest.isEmpty() && PRE_RELEASE.matcher(rest.startsWith(".") || rest.startsWith("-") || rest.startsWith("_") ? rest : "." + rest).find();
+	}
+
+	private static final java.util.regex.Pattern FLAVOUR = java.util.regex.Pattern.compile("(?i)^(jre|android)\\d*$");
+
+	/**
+	 * the mutually exclusive classifier of a version, currently "jre" or "android" (as used by Guava),
+	 * otherwise empty. When a range asks for one of these, {@link #latestVersion} only considers
+	 * versions with the same flavour.
+	 */
+	static String flavour(Object version) {
+		if (version == null) return "";
+		if (version instanceof org.osgi.framework.VersionRange) {
+			org.osgi.framework.VersionRange range = (org.osgi.framework.VersionRange) version;
+			String left = flavour(range.getLeft());
+			return !left.isEmpty() ? left : flavour(range.getRight());
+		}
+		String q;
+		if (version instanceof Version) q = ((Version) version).getQualifier();
+		else {
+			Version v = toVersion(version.toString(), null);
+			q = v == null ? "" : v.getQualifier();
+		}
+		if (q == null || q.isEmpty()) return "";
+		java.util.regex.Matcher m = FLAVOUR.matcher(q);
+		return m.matches() ? m.group(1).toLowerCase() : "";
 	}
 
 	private static String createToken(String prefix, String name) {
@@ -949,7 +976,11 @@ put(mappingsFallback, "org.apache.commons.commons-fileupload", new Info("commons
 
 	/**
 	 * a version as OSGi version, this also accepts the Maven spelling: 33.8.0-jre becomes 33.8.0.jre,
-	 * 2.17 becomes 2.17.0, 3.0-rc5 becomes 3.0.0.rc5 and 1.0.0.5 stays
+	 * 2.17 becomes 2.17.0, 3.0-rc5 becomes 3.0.0.rc5 and 1.0.0.5 stays.
+	 * Extra numeric segments become the qualifier with dots replaced by underscores (1.2.3.4.5
+	 * becomes 1.2.3.4_5), so two different Maven spellings can compare equal after parsing.
+	 * A numeric part that does not fit in an int (for example 20030203000129) returns
+	 * {@code defaultValue} silently; {@link #latestVersion} skips that entry.
 	 */
 	static Version toVersion(String version, Version defaultValue) {
 		if (Util.isEmpty(version, true)) return defaultValue;
