@@ -65,7 +65,9 @@ public final class OSGiServiceImpl implements OSGiService {
 			bundleDirectory = new File(root, "bundles");
 			if (!bundleDirectory.isDirectory()) bundleDirectory.mkdirs();
 
+			FrameworkFactory factory = ServiceLoader.load(FrameworkFactory.class, getClass().getClassLoader()).iterator().next();
 			Map<String, String> config = readDefaults();
+			addFelixDefaults(config, factory.getClass());
 			config.put("felix.cache.rootdir", root.getAbsolutePath());
 			String delegation = config.get(Constants.FRAMEWORK_BOOTDELEGATION);
 			config.put(Constants.FRAMEWORK_BOOTDELEGATION, delegation == null || delegation.trim().isEmpty() ? "lucee.*" : "lucee.*," + delegation);
@@ -76,7 +78,6 @@ public final class OSGiServiceImpl implements OSGiService {
 				if (over != null && !over.trim().isEmpty() && !Constants.FRAMEWORK_BOOTDELEGATION.equals(key)) config.put(key, over.trim());
 			}
 
-			FrameworkFactory factory = ServiceLoader.load(FrameworkFactory.class, getClass().getClassLoader()).iterator().next();
 			Framework f = factory.newFramework(config);
 			f.init();
 			f.start();
@@ -92,8 +93,11 @@ public final class OSGiServiceImpl implements OSGiService {
 
 	private static Map<String, String> readDefaults() throws IOException {
 		Properties props = new Properties();
-		try (InputStream is = OSGiServiceImpl.class.getResourceAsStream("/resources/default.properties")) {
-			if (is != null) props.load(is);
+		URL url = ownResource(OSGiServiceImpl.class, "resources/default.properties");
+		if (url != null) {
+			try (InputStream is = url.openStream()) {
+				props.load(is);
+			}
 		}
 		Map<String, String> config = new HashMap<>();
 		for (String key: props.stringPropertyNames()) {
@@ -101,6 +105,56 @@ public final class OSGiServiceImpl implements OSGiService {
 			config.put(key, removeQuotes(props.getProperty(key)));
 		}
 		return config;
+	}
+
+	/**
+	 * Felix reads its own configuration (system packages, the osgi.ee capabilities of the running Java,
+	 * ...) from "/default.properties" with its own class loader. The extension is loaded parent first,
+	 * so that finds the default.properties of the Lucee core instead, which has none of these settings.
+	 * Bundles that need an osgi.ee capability or a JDK package (javax.crypto, ...) can then not be
+	 * resolved. The defaults of Felix are read here from the Felix jar itself and given to the framework
+	 * as configuration, with property substitution enabled, so Felix still adds the packages and
+	 * capabilities it calculates for the running Java.
+	 */
+	static void addFelixDefaults(Map<String, String> config, Class<?> felixClass) throws IOException {
+		URL url = ownResource(felixClass, "default.properties");
+		if (url == null) return;
+		Properties props = new Properties();
+		try (InputStream is = url.openStream()) {
+			props.load(is);
+		}
+		// nothing to add when that is not the file of Felix
+		if (props.getProperty(Constants.FRAMEWORK_SYSTEMPACKAGES) == null && props.getProperty(Constants.FRAMEWORK_SYSTEMCAPABILITIES) == null) return;
+		for (String key: props.stringPropertyNames()) {
+			if (!config.containsKey(key)) config.put(key, props.getProperty(key));
+		}
+		// the values above contain placeholders like ${jre-${felix.detect.jpms}}
+		if (!config.containsKey("felix.systempackages.substitution")) config.put("felix.systempackages.substitution", "true");
+	}
+
+	/**
+	 * a resource from the jar the given class is loaded from, not one with the same name from a parent
+	 * class loader
+	 */
+	static URL ownResource(Class<?> clazz, String path) throws IOException {
+		ClassLoader cl = clazz.getClassLoader();
+		if (cl == null) return null;
+		String location = null;
+		try {
+			java.security.CodeSource cs = clazz.getProtectionDomain().getCodeSource();
+			if (cs != null && cs.getLocation() != null) location = cs.getLocation().toExternalForm();
+		}
+		catch (SecurityException se) {
+		}
+		URL first = null;
+		Enumeration<URL> urls = cl.getResources(path);
+		while (urls.hasMoreElements()) {
+			URL u = urls.nextElement();
+			if (first == null) first = u;
+			if (location != null && u.toExternalForm().startsWith("jar:" + location + "!/")) return u;
+			if (location != null && u.toExternalForm().startsWith(location)) return u;
+		}
+		return first;
 	}
 
 	private static String removeQuotes(String str) {

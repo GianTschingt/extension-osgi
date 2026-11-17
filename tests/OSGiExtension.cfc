@@ -64,7 +64,7 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="osgi" {
 				try {
 					var clazz = variables.service.loadClass( "com.google.gson", "2.10.1", "com.google.gson.Gson" );
 					assertBundleClassWorks( clazz, "com.google.gson", "2.10.1" );
-					var gson = clazz.getDeclaredConstructor().newInstance();
+					var gson = clazz.newInstance();
 					expect( gson.toJson( "hello" ) ).toBe( '"hello"' );
 				}
 				catch ( any e ) {
@@ -82,7 +82,7 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="osgi" {
 					var clazz = variables.service.loadClass( "org.apache.commons.commons-codec", "1.17.1", "org.apache.commons.codec.digest.DigestUtils" );
 					assertBundleClassWorks( clazz, "commons-codec", "1.17.1" );
 					var md5Hex = clazz.getMethod( "md5Hex", [ createObject( "java", "java.lang.String" ).getClass() ] );
-					expect( md5Hex.invoke( javacast( "null", "" ), "abc" ) ).toBe( "900150983cd24fb0d6963f7d28e17f72" );
+					expect( md5Hex.invoke( javacast( "null", "" ), [ "abc" ] ) ).toBe( "900150983cd24fb0d6963f7d28e17f72" );
 				}
 				catch ( any e ) {
 					fail( "Failed to load Maven bundle org.apache.commons.commons-codec:1.17.1 through the OSGi service, or a class from it did not work. "
@@ -101,8 +101,8 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="osgi" {
 					var clazz = variables.service.loadClass( "com.google.guava", "33.8.0-jre", "com.google.common.base.Strings" );
 					assertBundleClassWorks( clazz, "com.google.guava", "33.8.0-jre" );
 					var isNullOrEmpty = clazz.getMethod( "isNullOrEmpty", [ createObject( "java", "java.lang.String" ).getClass() ] );
-					expect( isNullOrEmpty.invoke( javacast( "null", "" ), "" ) ).toBeTrue();
-					expect( isNullOrEmpty.invoke( javacast( "null", "" ), "x" ) ).toBeFalse();
+					expect( isNullOrEmpty.invoke( javacast( "null", "" ), [ "" ] ) ).toBeTrue();
+					expect( isNullOrEmpty.invoke( javacast( "null", "" ), [ "x" ] ) ).toBeFalse();
 				}
 				catch ( any e ) {
 					fail( "Failed to load guava 33.8.0-jre through the OSGi service. "
@@ -132,15 +132,15 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="osgi" {
 					assertBundleClassWorks( clazz, "jackson-databind", "2.17.0" );
 					var annotationsClass = clazz.getClassLoader().loadClass( "com.fasterxml.jackson.annotation.JsonProperty" );
 					var info = variables.service.getInfo( annotationsClass );
-					if ( isNull( info ) || isNull( info.version ) ) {
+					if ( isNull( info ) || isNull( info[ "version" ] ) ) {
 						fail( "jackson-databind 2.17.0 loaded, but jackson-annotations could not be identified, so the resolved version could not be checked against [2.17,3)." );
 					}
-					var ver = toString( info.version );
+					var ver = toString( info[ "version" ] );
 					if ( isPreRelease( ver ) || !isVersionInHalfOpenRange( ver, "2.17", "3.0" ) ) {
 						fail( "jackson-databind 2.17.0 resolved jackson-annotations to [#ver#], which is outside the range [2.17,3) or is a pre-release. "
 							& "The resolver must not pick a pre-release such as 3.0-rc5." );
 					}
-					var mapper = clazz.getDeclaredConstructor().newInstance();
+					var mapper = clazz.newInstance();
 					expect( mapper.writeValueAsString( "hello" ) ).toBe( '"hello"' );
 				}
 				catch ( any e ) {
@@ -236,8 +236,8 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="osgi" {
 		if ( isNull( id ) ) {
 			fail( "The class for #arguments.label# #arguments.version# was not loaded from an OSGi bundle (getId was null). The service may have fallen back to the normal classloader." );
 		}
-		if ( isNull( info ) || isNull( info.state ) || !listFindNoCase( "active,resolved,starting", info.state ) ) {
-			var state = ( !isNull( info ) && !isNull( info.state ) ) ? info.state : "unknown";
+		if ( isNull( info ) || isNull( info[ "state" ] ) || !listFindNoCase( "active,resolved,starting", info[ "state" ] ) ) {
+			var state = ( !isNull( info ) && !isNull( info[ "state" ] ) ) ? info[ "state" ] : "unknown";
 			fail( "The bundle for #arguments.label# #arguments.version# is not resolved or active (state: #state#, id: #id#)." );
 		}
 	}
