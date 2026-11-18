@@ -1,81 +1,208 @@
 name: Java CI
 
-on: [push, pull_request, workflow_dispatch]
+# Push to main publishes a new numbered -SNAPSHOT to maven.lucee-services.com, never Maven Central.
+# A manual run with deploy ticked publishes the next build number with the chosen qualifier:
+#   release (no qualifier): Maven Central and maven.lucee-services.com, plus a GitHub release
+#   ALPHA / BETA / RC:      maven.lucee-services.com and a GitHub pre-release, never Central
+#   SNAPSHOT:               maven.lucee-services.com, never Central
+# The .lex files on maven.lucee-services.com and GitHub Releases are the ones built and tested
+# in this workflow. A final also runs `mvn deploy` so Maven Central gets a signed rebuild of
+# the same commit; that rebuild is not what S3 and GitHub publish.
+# Build numbers come from git tags, Maven Central, the Central snapshot repository, and maven.lucee-services.com.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Publish a new build number. Finals go to Maven Central; ALPHA, BETA, RC and SNAPSHOT go to maven.lucee-services.com only'
+        type: boolean
+        default: false
+      qualifier:
+        description: 'Qualifier for this run. "pom" keeps extension.version.qualifier from pom.xml (-SNAPSHOT). SNAPSHOT, ALPHA, BETA and RC are published to maven.lucee-services.com, never Maven Central. "release" (no qualifier) is the final and goes to Maven Central'
+        type: choice
+        options: [pom, SNAPSHOT, ALPHA, BETA, RC, release]
+        default: pom
+
+# Runs that publish share one group, so a manual deploy and a push to main cannot resolve
+# the same build number. Other runs (PRs, manual runs without deploy) stay per-ref.
+# queue: max keeps up to 100 pending runs (default would keep only one and cancel older pending runs).
+concurrency:
+  group: ${{ ((github.event_name == 'workflow_dispatch' && inputs.deploy) || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'osgi-extension-deploy' || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
-  setup:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # like Lucee core (LDEV-6516): every push to main publishes a new build, a manual run publishes when deploy is ticked.
+      # PRs never publish. Runs without the deploy secrets (forks) only build and test, see "Resolve next revision".
+      DO_DEPLOY: ${{ (github.event_name == 'workflow_dispatch' && inputs.deploy) || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+      QUALIFIER_INPUT: ${{ inputs.qualifier || 'pom' }}
     outputs:
       version: ${{ steps.extract-version.outputs.VERSION }}
+      tag: ${{ steps.extract-version.outputs.TAG }}
+      deploy: ${{ steps.extract-version.outputs.DEPLOY }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
-          distribution: 'temurin'
           java-version: '21'
+          distribution: 'temurin'
 
       - name: Cache Maven packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
-          path: ~/.m2
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('pom.xml') }}
+          restore-keys: maven-
+
+      # ubuntu-latest moved to Maven 3.10.0 (runner image 20261004). With it, central-publishing-maven-plugin
+      # leaves maven-metadata-local.xml in the staging dir, which Central rejects. Pin Maven 3.9.x like Lucee core.
+      - name: Set up Maven 3.9.16
+        run: |
+          MVN_VERSION=3.9.16
+          MVN_SHA512=831a8591fe20c8243b1dbe7d71e3244f31d1665b0804b2e825e38cbbe5ce0cafb8338851f90780735568773e0a6cd07bbec107cda0b896b008b861075358b6f6
+          curl -fsSL -o "$RUNNER_TEMP/maven.tar.gz" "https://repo1.maven.org/maven2/org/apache/maven/apache-maven/$MVN_VERSION/apache-maven-$MVN_VERSION-bin.tar.gz"
+          echo "$MVN_SHA512  $RUNNER_TEMP/maven.tar.gz" | sha512sum -c -
+          tar xzf "$RUNNER_TEMP/maven.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-$MVN_VERSION/bin" >> $GITHUB_PATH
+          "$RUNNER_TEMP/apache-maven-$MVN_VERSION/bin/mvn" -v
+
+      - name: Resolve next revision
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+        run: |
+          set -euo pipefail
+          # Only builds that publish allocate a build number: every push to main and manual runs with deploy ticked.
+          # PRs and runs without the deploy secrets (forks) keep the default POM revision (base.0 + qualifier) and publish nothing.
+          if [ "$DO_DEPLOY" != "true" ]; then
+            echo "Skipping revision bump (not a push to main / manual deploy)"
+            exit 0
+          fi
+          # without deploy credentials nothing gets published, so do not consume a build number
+          if [ -z "$GPG_PASSPHRASE" ] || [ -z "$MAVEN_USERNAME" ]; then
+            echo "Skipping revision bump (no GPG / Maven deploy credentials; test-only run)"
+            exit 0
+          fi
+
+          BASE=$(mvn help:evaluate -Dexpression=extension.version.base -q -DforceStdout | tr -d '\r')
+          QUALIFIER=$(mvn help:evaluate -Dexpression=extension.version.qualifier -q -DforceStdout | tr -d '\r')
+          # an empty property evaluates to "null"
+          [ "$QUALIFIER" == "null" ] && QUALIFIER=""
+          # a manual run can publish the current code as ALPHA, BETA, RC or final release instead of the pom qualifier
+          case "$QUALIFIER_INPUT" in
+            pom|"") ;;
+            release) QUALIFIER="" ;;
+            SNAPSHOT|ALPHA|BETA|RC) QUALIFIER="-$QUALIFIER_INPUT" ;;
+            *) echo "::error::unknown qualifier input [$QUALIFIER_INPUT]"; exit 1 ;;
+          esac
+          echo "Base=$BASE qualifier=$QUALIFIER"
+          BASE_RE=$(printf '%s' "$BASE" | sed 's/\./\\./g')
+
+          git fetch --tags --force origin 2>/dev/null || true
+
+          # highest build of this base, from git tags (base.N), Maven Central, the Central snapshot repository
+          # and maven.lucee-services.com (base.N[-QUALIFIER]). All are checked so a version published without a
+          # tag (e.g. 1.0.0.0-ALPHA) or only to the Lucee Maven repository is never built twice.
+          BUILDS=$(git tag -l "${BASE}.*" | sed -nE "s/^${BASE_RE}\.([0-9]+)$/\1/p" || true)
+          for url in \
+            "https://repo1.maven.org/maven2/org/lucee/osgi-extension/maven-metadata.xml" \
+            "https://repo1.maven.org/maven2/org/lucee/osgi/maven-metadata.xml" \
+            "https://central.sonatype.com/repository/maven-snapshots/org/lucee/osgi-extension/maven-metadata.xml" \
+            "https://central.sonatype.com/repository/maven-snapshots/org/lucee/osgi/maven-metadata.xml" \
+            "https://maven.lucee-services.com/org/lucee/osgi-extension/maven-metadata.xml" \
+            "https://maven.lucee-services.com/org/lucee/osgi/maven-metadata.xml"
+          do
+            META=$(curl -fsSL --max-time 30 "$url" 2>/dev/null || true)
+            BUILDS="$BUILDS"$'\n'$(printf '%s' "$META" | grep -oE "<version>${BASE_RE}\.[0-9]+([-.][^<]*)?</version>" | sed -E "s#<version>${BASE_RE}\.([0-9]+).*#\1#" || true)
+          done
+          MAX_BUILD=$(printf '%s\n' "$BUILDS" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+
+          if [ -z "$MAX_BUILD" ]; then
+            NEXT_BUILD=0
+          else
+            NEXT_BUILD=$((MAX_BUILD + 1))
+          fi
+
+          VERSION="${BASE}.${NEXT_BUILD}${QUALIFIER}"
+          # tag shape matches existing tags (1.0.0.0, 1.0.0.1): numeric 4-part without qualifier
+          TAG="${BASE}.${NEXT_BUILD}"
+          echo "Resolved VERSION=$VERSION TAG=$TAG (max seen build=${MAX_BUILD:-none})"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "DEPLOY=true" >> "$GITHUB_ENV"
 
       - name: Extract version number
         id: extract-version
         run: |
-          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          set -euo pipefail
+          if [ -z "${VERSION:-}" ]; then
+            VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout | tr -d '\r')
+          fi
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){3}(-[A-Za-z0-9]+)*$'; then
+            echo "::error::[$VERSION] is not a valid extension version"; exit 1
+          fi
+          echo "Using VERSION=$VERSION TAG=${TAG:-}"
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "TAG=${TAG:-}" >> $GITHUB_OUTPUT
+          echo "DEPLOY=${DEPLOY:-false}" >> $GITHUB_OUTPUT
 
-      - name: Cache Lucee files
-        uses: actions/cache@v4
+      - name: Build extension
+        env:
+          VERSION: ${{ steps.extract-version.outputs.VERSION }}
+        run: mvn -B -e clean package -Dgoal=install -Drevision="$VERSION"
+
+      # one artifact for test, S3 (LDEV-6568) and the GitHub release: full and lite .lex plus the flattened POM
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
         with:
-          path: ~/work/_actions/lucee/script-runner/main/lucee-download-cache
-          key: lucee-downloads
+          name: osgi-s3
+          include-hidden-files: true
+          path: |
+            target/*.lex
+            .flattened-pom.xml
 
-  build-and-test:
+  test:
     runs-on: ubuntu-latest
-    needs: setup
-    env:
-      LUCEE_TEST_VERSIONS_9: ${{ vars.LUCEE_TEST_VERSIONS_9 }}
+    timeout-minutes: 30
+    needs: build
     strategy:
       fail-fast: false
       matrix:
-        lucee: ${{ fromJSON(vars.LUCEE_TEST_VERSIONS_9) }}
+        # repository variables are not available to pull requests from forks, fall back to a fixed 9.0 build
+        lucee: ${{ fromJSON(vars.LUCEE_TEST_VERSIONS_9 || '[{"version":"9.0.0.1487-ALPHA","query":"9.0/all/light","branch":"9.0"}]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Build and Install with Maven
-        env:
-          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
-          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          echo "------- Maven Install -------";
-          mvn -B -e -f pom.xml clean install -Dgoal=install
-
-      - name: Set artifact name
-        id: artifact
-        run: echo "name=osgi-lex-$(echo '${{ matrix.lucee.query }}' | tr '/' '-')" >> $GITHUB_OUTPUT
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Cache Lucee files
+        uses: actions/cache@v5
         with:
-          name: ${{ steps.artifact.outputs.name }}
-          path: target/*.lex
+          path: ~/work/_actions/lucee/script-runner/main/lucee-download-cache
+          key: lucee-downloads
+
+      - name: Download extension artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: osgi-s3
+      # the test runner installs every .lex in extensionDir; keep only the full one
+      - name: Keep the full lex for the tests
+        run: rm -f target/*.lite.lex
 
       - name: Checkout Lucee
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: lucee/lucee
           path: lucee
@@ -85,7 +212,7 @@ jobs:
       - name: Download Lucee ${{ matrix.lucee.version }}
         run: |
           mkdir -p "${{ runner.temp }}/lucee-jar"
-          curl -fsSL -o "${{ runner.temp }}/lucee-jar/lucee-light-${{ matrix.lucee.version }}.jar" \
+          curl -fsSL --retry 3 -o "${{ runner.temp }}/lucee-jar/lucee-light-${{ matrix.lucee.version }}.jar" \
             "${{ vars.LUCEE_MAVEN_URL || 'https://maven.lucee-services.com' }}/org/lucee/lucee/${{ matrix.lucee.version }}/lucee-${{ matrix.lucee.version }}-light.jar"
 
       - name: Run Lucee Test Suite
@@ -104,45 +231,157 @@ jobs:
 
   deploy:
     runs-on: ubuntu-latest
-    needs: [setup, build-and-test]
-    if: always() && needs.build-and-test.result == 'success'
+    timeout-minutes: 15
+    needs: [build, test]
+    # set by the build job: push to the release branch or manual deploy, with the deploy secrets available
+    if: needs.build.outputs.deploy == 'true'
+    permissions:
+      # push the tag of the published revision
+      contents: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
+      # SNAPSHOT, ALPHA, BETA and RC publish the tested .lex from the build job (S3 and GitHub).
+      # Only a final is rebuilt here, so Maven Central can get a signed deploy of the same commit.
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        if: ${{ !contains(needs.build.outputs.version, '-') }}
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '21'
 
+      # ubuntu-latest moved to Maven 3.10.0 (runner image 20261004). With it, central-publishing-maven-plugin
+      # leaves maven-metadata-local.xml in the staging dir, which Central rejects. Pin Maven 3.9.x like Lucee core.
+      - name: Set up Maven 3.9.16
+        if: ${{ !contains(needs.build.outputs.version, '-') }}
+        run: |
+          MVN_VERSION=3.9.16
+          MVN_SHA512=831a8591fe20c8243b1dbe7d71e3244f31d1665b0804b2e825e38cbbe5ce0cafb8338851f90780735568773e0a6cd07bbec107cda0b896b008b861075358b6f6
+          curl -fsSL -o "$RUNNER_TEMP/maven.tar.gz" "https://repo1.maven.org/maven2/org/apache/maven/apache-maven/$MVN_VERSION/apache-maven-$MVN_VERSION-bin.tar.gz"
+          echo "$MVN_SHA512  $RUNNER_TEMP/maven.tar.gz" | sha512sum -c -
+          tar xzf "$RUNNER_TEMP/maven.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-$MVN_VERSION/bin" >> $GITHUB_PATH
+          "$RUNNER_TEMP/apache-maven-$MVN_VERSION/bin/mvn" -v
+
       - name: Cache Maven packages
-        uses: actions/cache@v4
+        if: ${{ !contains(needs.build.outputs.version, '-') }}
+        uses: actions/cache@v5
         with:
-          path: ~/.m2
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('pom.xml') }}
+          restore-keys: maven-
 
       - name: Import GPG key
+        if: ${{ !contains(needs.build.outputs.version, '-') }}
         run: |
           echo "$GPG_PRIVATE_KEY" | base64 --decode | gpg --batch --import
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
-      - name: Build and Deploy with Maven
+      - name: Deploy final to Maven Central
+        if: ${{ !contains(needs.build.outputs.version, '-') }}
         env:
+          VERSION: ${{ needs.build.outputs.version }}
           MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
           MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          if [[ "${{ needs.setup.outputs.version }}" == *-SNAPSHOT ]]; then
-            echo "------- Maven Deploy snapshot on ${{ github.event_name }} -------";
-            mvn -B -e -f pom.xml clean deploy -Dgoal=deploy -DperformRelease=true --settings maven-settings.xml
-          elif [[ "${{ needs.setup.outputs.version }}" == *-ALPHA ]]; then
-            echo "------- Maven Install alpha on ${{ github.event_name }} -------";
-            mvn -B -e -f pom.xml clean install -Dgoal=install --settings maven-settings.xml
-          else
-            echo "------- Maven Deploy release on ${{ github.event_name }} -------";
-            mvn -B -e -f pom.xml clean deploy -Dgoal=deploy -DperformRelease=true --settings maven-settings.xml
+          set -euo pipefail
+          # Only a final release (no qualifier) is deployed to Maven Central, using the same ossrh server
+          # id, MAVEN_USERNAME / MAVEN_PASSWORD secrets and maven-settings.xml as the other extensions.
+          # This is a signed rebuild of the same commit; S3 and GitHub Releases keep the tested .lex
+          # from the build job. ALPHA, BETA, RC and SNAPSHOT are not rebuilt and never go to Central.
+          echo "------- Maven Deploy release $VERSION to Maven Central (signed rebuild of the tested commit) -------"
+          mvn -B -e clean deploy -Dgoal=deploy -DperformRelease=true -Drevision="$VERSION" --settings maven-settings.xml
+
+      - name: Tag published revision
+        if: success() && needs.build.outputs.tag != ''
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin 2>/dev/null || true
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists - skipping"
+            exit 0
           fi
+          echo "Creating annotated tag $TAG for $VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$VERSION"
+          git push origin "refs/tags/$TAG"
+
+  # LDEV-6602: publish every final, ALPHA, BETA and RC build as a GitHub release with its .lex files attached,
+  # so downloads can be served from GitHub releases. ALPHA, BETA and RC are marked as pre-releases.
+  # -SNAPSHOT builds get no GitHub release.
+  # Separate job, so a failure here never blocks the Maven Central or Lucee Maven repository upload.
+  github-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build, deploy]
+    if: needs.build.outputs.deploy == 'true' && !endsWith(needs.build.outputs.version, '-SNAPSHOT')
+    permissions:
+      # create the release (and the tag of a qualifier version) and upload its assets
+      contents: write
+    steps:
+      # the same files the S3 job uploads (built by the build job with the published version)
+      - name: Download published extension
+        uses: actions/download-artifact@v8
+        with:
+          name: osgi-s3
+          path: release-files
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+          IS_DEFAULT_BRANCH: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < <(find release-files -type f \( -name "*-${VERSION}.lex" -o -name "*-${VERSION}.lite.lex" \) | sort)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::error::no .lex files for $VERSION found"; find release-files -type f; exit 1
+          fi
+          printf 'Asset: %s\n' "${FILES[@]}"
+
+          # the release tag is the exact published version. A final release (1.0.0.3) reuses the build tag the deploy job
+          # pushed, a qualifier version (1.0.0.3-RC) gets its own tag on the same commit. Qualifier tags do not match
+          # the build number lookup (^BASE\.([0-9]+)$) in "Resolve next revision".
+          if [[ "$VERSION" == *-* ]]; then
+            PRE=(--prerelease --latest=false)
+          elif [ "$IS_DEFAULT_BRANCH" == "true" ]; then
+            PRE=(--latest)
+          else
+            PRE=(--latest=false)
+          fi
+          if [ "$VERSION" == "$TAG" ]; then
+            TARGET=(--verify-tag)
+          else
+            # creates the tag on this commit if it does not exist yet
+            TARGET=(--target "$GITHUB_SHA")
+          fi
+
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists - uploading assets again"
+            gh release upload "$VERSION" "${FILES[@]}" --clobber
+          else
+            echo "Creating release $VERSION ${PRE[*]} ${TARGET[*]}"
+            gh release create "$VERSION" "${FILES[@]}" "${PRE[@]}" "${TARGET[@]}" \
+              --title "$VERSION" \
+              --notes "Build $VERSION from commit $GITHUB_SHA, published by $RUN_URL"
+          fi
+
+  # upload the published build to cdn.lucee.org in Maven layout, LDEV-6568.
+  # Cut-off rules (SNAPSHOTs stop on 2027-03-01) live in the called workflow.
+  s3:
+    needs: [build, deploy]
+    if: needs.build.outputs.deploy == 'true'
+    uses: lucee/lucee/.github/workflows/extension-s3-upload.yml@7.1
+    with:
+      artifact-name: osgi-s3
+      version: ${{ needs.build.outputs.version }}
+    secrets: inherit

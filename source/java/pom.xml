@@ -31,12 +31,16 @@
   </developers>
 
   <properties>
+    <!-- the build.xml of the extension passes -Drevision with the version of the extension,
+         this default is only used when this pom is built on its own -->
+    <revision>1.0.0.0-SNAPSHOT</revision>
     <!-- needs a Lucee 9 that has lucee.runtime.osgi.BundleService (LDEV-6627) -->
     <lucee.version>9.0.0.1487-ALPHA</lucee.version>
   </properties>
 
   <build>
     <sourceDirectory>src</sourceDirectory>
+    <testSourceDirectory>test</testSourceDirectory>
     <plugins>
 
       <plugin>
@@ -131,6 +135,12 @@
 
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.11.0</version>
         <configuration>
@@ -199,6 +209,12 @@
       <artifactId>lucee</artifactId>
       <version>${lucee.version}</version>
       <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.11.4</version>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 
