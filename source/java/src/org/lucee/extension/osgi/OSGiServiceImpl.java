@@ -79,9 +79,20 @@ public final class OSGiServiceImpl implements OSGiService {
 				if (over != null && !over.trim().isEmpty() && !Constants.FRAMEWORK_BOOTDELEGATION.equals(key)) config.put(key, over.trim());
 			}
 
-			Framework f = factory.newFramework(config);
-			f.init();
-			f.start();
+			File cache = new File(root, "felix-cache");
+			boolean cacheExisted = cache.exists();
+			Framework f;
+			try {
+				f = startFramework(factory, config);
+			}
+			catch (Exception e) {
+				// an invalid felix cache (LDEV-6144, felix reports "Error creating bundle cache." or fails later with another error
+				// depending on what is damaged), the cache can be rebuilt, so we delete it and try once more, the bundles are installed
+				// again when they are needed
+				if (!cacheExisted) throw e;
+				deleteRecursive(cache);
+				f = startFramework(factory, config);
+			}
 			return framework = f;
 		}
 		catch (IOException e) {
@@ -90,6 +101,23 @@ public final class OSGiServiceImpl implements OSGiService {
 		catch (Exception e) {
 			throw new IOException("failed to start the OSGi framework: " + e.getMessage(), e);
 		}
+	}
+
+	private static Framework startFramework(FrameworkFactory factory, Map<String, String> config) throws BundleException {
+		Framework f = factory.newFramework(config);
+		f.init();
+		f.start();
+		return f;
+	}
+
+	private static void deleteRecursive(File file) {
+		File[] children = file.listFiles();
+		if (children != null) {
+			for (File child: children) {
+				deleteRecursive(child);
+			}
+		}
+		file.delete();
 	}
 
 	private static Map<String, String> readDefaults() throws IOException {
